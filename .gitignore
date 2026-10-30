@@ -1,0 +1,15 @@
+.mcp.json
+/.agents/
+/.vscode/
+/.claude/*.lock
+/.claude/*.json
+outputs/
+scripts/
+temp/
+tmp/
+!/.claude/skills/**
+.env
+.env.local
+.env.*.local
+*.pyc
+/.venv/
