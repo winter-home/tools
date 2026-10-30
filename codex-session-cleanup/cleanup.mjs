@@ -94,6 +94,10 @@ function inside(root, file) {
   return relative !== '' && !relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative);
 }
 
+// Codex compresses older rollouts in place to <name>.jsonl.zst and keeps the
+// .jsonl path in its database, so both spellings belong to the same session.
+export const rolloutFiles = file => [file, file + '.zst'];
+
 export function fileInfo(thread, home) {
   if (!thread.path || !uuid.test(thread.id)) throw new Error(`Missing or invalid session path: ${thread.id}`);
   const file = path.resolve(thread.path);
@@ -102,19 +106,23 @@ export function fileInfo(thread, home) {
   if (!root || path.extname(file) !== '.jsonl' || !path.basename(file).includes(thread.id)) {
     throw new Error(`Unexpected rollout path: ${file}`);
   }
-  let stat;
-  try { stat = fs.lstatSync(file); } catch (e) {
-    if (e.code === 'ENOENT') return { file, bytes: 0, modified: 0, exists: false };
-    throw e;
+  let bytes = 0, modified = 0, exists = false;
+  for (const stored of rolloutFiles(file)) {
+    let stat;
+    try { stat = fs.lstatSync(stored); } catch (e) {
+      if (e.code === 'ENOENT') continue;
+      throw e;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Not a regular rollout: ${stored}`);
+    const realRoot = fs.realpathSync.native(root);
+    // Session roots themselves must not be redirected to an unrelated directory.
+    const realHome = fs.realpathSync.native(home);
+    if (!inside(realHome, realRoot) || !inside(realRoot, fs.realpathSync.native(stored))) {
+      throw new Error(`Rollout escapes Codex home: ${stored}`);
+    }
+    bytes += stat.size; modified = Math.max(modified, stat.mtimeMs / 1000); exists = true;
   }
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Not a regular rollout: ${file}`);
-  const realRoot = fs.realpathSync.native(root);
-  // Session roots themselves must not be redirected to an unrelated directory.
-  const realHome = fs.realpathSync.native(home);
-  if (!inside(realHome, realRoot) || !inside(realRoot, fs.realpathSync.native(file))) {
-    throw new Error(`Rollout escapes Codex home: ${file}`);
-  }
-  return { file, bytes: stat.size, modified: stat.mtimeMs / 1000, exists: true };
+  return { file, bytes, modified, exists };
 }
 
 export async function listAll(rpc, includeArchived = true, extra = {}) {
@@ -324,7 +332,7 @@ export async function run(options = {}) {
           const check = await recheckGroup(rpc, group, home, protectedIds, cutoff);
           if (!check.allowed) { report.skipped.push({ rootId: group.rootId, reason: check.reason }); save(); continue; }
           await rpc.request('thread/delete', { threadId: group.rootId });
-          const remaining = check.group.files.filter(f => fs.existsSync(f.file));
+          const remaining = check.group.files.flatMap(f => rolloutFiles(f.file)).filter(f => fs.existsSync(f));
           if (remaining.length) throw new Error('Deletion API returned but rollout files remain');
           report.deleted.push({ rootId: group.rootId, ids: group.ids, bytes: check.group.bytes });
           save();

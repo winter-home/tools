@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import zlib from 'node:zlib';
 import { randomUUID } from 'node:crypto';
 import { planCleanup, listAll, readPins, recheckGroup, Rpc, locateCodex, run } from './cleanup.mjs';
 
@@ -58,6 +59,29 @@ test('a protected or recent descendant protects its entire family', () => {
   assert.equal(p.groups.length, 1); assert.equal(p.groups[0].ids.length, 2);
 });
 
+// Mirrors Codex, which compresses old rollouts in place and keeps their modified time.
+// keepPlain leaves the .jsonl as well, as during an unfinished compression.
+function compress(t, modified = t.updatedAt, keepPlain = false) {
+  fs.writeFileSync(t.path + '.zst', zlib.zstdCompressSync(fs.readFileSync(t.path)));
+  fs.utimesSync(t.path + '.zst', modified, modified);
+  if (!keepPlain) fs.unlinkSync(t.path);
+}
+
+test('compressed rollouts count as existing logs and keep recent-session protection', () => {
+  const home = fixture();
+  const compressed = thread(home), both = thread(home), newer = thread(home);
+  const plainNewer = thread(home, { modified: recent }), compressedNewer = thread(home);
+  compress(compressed); compress(newer, recent);
+  compress(both, old, true); compress(plainNewer, old, true); compress(compressedNewer, recent, true);
+  const p = planCleanup([compressed, both, newer, plainNewer, compressedNewer], new Set(), new Set(), cutoff, home);
+  assert.deepEqual(p.groups.map(g => g.rootId), [compressed.id, both.id], JSON.stringify([...p.reasons]));
+  assert.equal(p.groups[0].bytes, fs.statSync(compressed.path + '.zst').size);
+  assert.equal(p.groups[0].files[0].exists, true);
+  assert.equal(p.groups[1].bytes, fs.statSync(both.path).size + fs.statSync(both.path + '.zst').size);
+  // With both spellings present, the newer of the two decides recency.
+  for (const t of [newer, plainNewer, compressedNewer]) assert(p.reasons.get(t.id).includes('recent'));
+});
+
 test('missing parent and paths outside the sessions directory cannot be deleted', () => {
   const home = fixture();
   const orphan = thread(home, { parent: randomUUID() });
@@ -86,6 +110,11 @@ test('Windows extended paths outside the session roots and junction escapes rema
   fs.symlinkSync(path.dirname(escaped.path), link, 'junction');
   const throughLink = { ...escaped, path: path.toNamespacedPath(path.join(link, path.basename(escaped.path))) };
   assert.equal(planCleanup([throughLink], new Set(), new Set(), cutoff, home).groups.length, 0);
+  // A compressed rollout behind the junction has no .jsonl, so only the .zst check can exclude it.
+  const compressedEscape = thread(outside); compress(compressedEscape);
+  const compressedLink = { ...compressedEscape,
+    path: path.toNamespacedPath(path.join(link, path.basename(compressedEscape.path))) };
+  assert.equal(planCleanup([compressedLink], new Set(), new Set(), cutoff, home).groups.length, 0);
 });
 
 test('all source kinds and archived pages are paginated, with repeated cursors rejected', async () => {
@@ -135,11 +164,41 @@ test('retention below seven days is rejected', async () => {
   await assert.rejects(run({ days: 6 }), /Retention must be at least 7 days/);
 });
 
+// A stand-in app-server that answers like Codex but never removes the rollout on thread/delete.
+const leakyServer = `
+import fs from 'node:fs';
+import path from 'node:path';
+import { createInterface } from 'node:readline';
+const thread = JSON.parse(fs.readFileSync(path.join(process.env.CODEX_HOME, 'fake-thread.json'), 'utf8'));
+createInterface({ input: process.stdin }).on('line', line => {
+  const { id, method, params = {} } = JSON.parse(line);
+  if (id === undefined) return;
+  const result = method === 'thread/read' ? { thread }
+    : method === 'thread/list' ? { data: params.archived || params.ancestorThreadId ? [] : [thread], nextCursor: null }
+    : {};
+  process.stdout.write(JSON.stringify({ id, result }) + '\\n');
+});
+`;
+
+test('a compressed rollout left behind by a successful delete call is reported as a failure', async () => {
+  const home = fixture(), t = thread(home);
+  compress(t);
+  const entry = path.join(home, 'leaky-app-server.mjs'); fs.writeFileSync(entry, leakyServer);
+  fs.writeFileSync(path.join(home, 'fake-thread.json'), JSON.stringify(t));
+  const protect = path.join(home, 'protect.json'); fs.writeFileSync(protect, '[]');
+  await assert.rejects(run({ home, protectFile: protect, apply: true, entry, output: 'quiet' }), e => {
+    const report = JSON.parse(fs.readFileSync(e.message.match(/inspect (.+)$/)[1], 'utf8'));
+    assert.deepEqual(report.deleted, []);
+    assert.deepEqual(report.failed, [{ rootId: t.id, error: 'Deletion API returned but rollout files remain' }]);
+    return true;
+  });
+});
+
 test('official deletion API removes only eligible synthetic logs and their metadata', { timeout: 180000 }, async () => {
   const home = fixture();
   const oldRoot = thread(home), child = thread(home, { parent: oldRoot.id });
   const oldArchived = thread(home, { archived: true });
-  const missingRollout = thread(home);
+  const missingRollout = thread(home), compressed = thread(home);
   const pinned = thread(home), newer = thread(home, { updatedAt: recent });
   const held = thread(home), familyRoot = thread(home), familyChild = thread(home, { parent: familyRoot.id, updatedAt: recent });
   const retained = [pinned, newer, held, familyRoot, familyChild];
@@ -150,7 +209,7 @@ test('official deletion API removes only eligible synthetic logs and their metad
     await rpc.initialize();
     // Import these hand-written test rollouts into this isolated test database.
     const all = await listAll(rpc, true, { useStateDbOnly: false });
-    assert.equal(all.length, 9);
+    assert.equal(all.length, 10);
     const childRecord = all.find(t => t.id === child.id);
     assert.equal(childRecord.parentThreadId || childRecord.source?.subAgent?.thread_spawn?.parent_thread_id
       || childRecord.source?.subagent?.thread_spawn?.parent_thread_id, oldRoot.id, JSON.stringify(childRecord));
@@ -169,13 +228,16 @@ test('official deletion API removes only eligible synthetic logs and their metad
     try { assert.equal(db.prepare('SELECT id FROM threads WHERE id = ?').get(missingRollout.id), undefined); }
     finally { db.close(); }
   } finally { staleRpc.close(); }
+  compress(compressed);
   const before = fs.readFileSync(oldRoot.path);
   const preview = await run({ home, protectFile: protect });
   assert.equal(preview.days, 7);
-  assert.equal(preview.candidateSessions, 3);
+  assert.equal(preview.candidateSessions, 4);
+  assert(preview.candidates.find(g => g.rootId === compressed.id).bytes > 0);
   assert.deepEqual(fs.readFileSync(oldRoot.path), before);
   const result = await run({ home, protectFile: protect, apply: true });
-  assert.equal(result.deleted.reduce((n,g) => n + g.ids.length, 0), 3);
+  assert.equal(result.deleted.reduce((n,g) => n + g.ids.length, 0), 4);
   for (const t of [oldRoot, child, oldArchived]) assert.equal(fs.existsSync(t.path), false);
+  assert.equal(fs.existsSync(compressed.path + '.zst'), false);
   for (const t of retained) assert.equal(fs.existsSync(t.path), true);
 });
