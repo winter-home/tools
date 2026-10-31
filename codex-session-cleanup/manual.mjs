@@ -1,31 +1,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { run } from './cleanup.mjs';
-import { formatResult } from './output.mjs';
+import { formatResult, formatTextReport } from './output.mjs';
+import { repairCatalog } from './catalog.mjs';
+import { ensureCodexClosed } from './processes.mjs';
+import { loadSqlite } from './runtime.mjs';
+export { ensureCodexClosed } from './processes.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const exec = promisify(execFile);
-
-export async function ensureCodexClosed() {
-  const powershell = path.join(process.env.SystemRoot || 'C:\\Windows',
-    'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const script = "$ErrorActionPreference='Stop'; @(@(Get-Process -Name Codex -ErrorAction SilentlyContinue) | Select-Object Id,ProcessName) | ConvertTo-Json -Compress";
-  const { stdout } = await exec(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script],
-    { windowsHide: true, timeout: 20000 });
-  const value = stdout.trim();
-  const parsed = value ? JSON.parse(value) : [];
-  const processes = Array.isArray(parsed) ? parsed : [parsed];
-  if (processes.length) {
-    throw new Error('Codex 앱과 Codex CLI/IDE 세션을 모두 종료한 뒤 manual.cmd를 다시 실행해 주세요. 실행 중인 Codex가 있어 삭제하지 않았습니다.');
-  }
-}
 
 export async function manual({ checkClosed = ensureCodexClosed, runCleanup = run,
-  ask, log = console.log, protectionFile = path.join(here, 'runtime-manual-protected.json') } = {}) {
+  checkRuntime = loadSqlite, syncCatalog = repairCatalog, ask, log = console.log,
+  protectionFile = path.join(here, 'runtime-manual-protected.json'),
+  backupDir = path.join(here, 'reports', 'catalog-backups') } = {}) {
+  await checkRuntime();
   await checkClosed();
   log('Codex 세션 정리 — 완료될 때까지 Codex를 닫아 두세요.');
   const preview = await runCleanup();
@@ -37,9 +27,35 @@ export async function manual({ checkClosed = ensureCodexClosed, runCleanup = run
   await new Promise(resolve => setTimeout(resolve, 100));
   await checkClosed();
   fs.writeFileSync(protectionFile, '[]\n', 'utf8');
-  const result = await runCleanup({ apply: true, protectFile: protectionFile,
-    approvedGroups: preview.candidates, output: 'quiet' });
+  let result, cleanupError;
+  try {
+    result = await runCleanup({ apply: true, protectFile: protectionFile,
+      approvedGroups: preview.candidates, output: 'quiet' });
+  } catch (error) {
+    if (!error.report) throw error;
+    result = error.report;
+    cleanupError = error;
+  }
+  let catalogError;
+  try {
+    // Let the cleanup app-server finish exiting before checking for live Codex processes.
+    await new Promise(resolve => setTimeout(resolve, 100));
+    result.catalogCleanup = await syncCatalog({ home: result.home, reports: [result],
+      apply: true, backupDir, checkClosed });
+  } catch (error) {
+    catalogError = error;
+    result.catalogCleanupError = error.message;
+  }
+  if (result.reportPath) fs.writeFileSync(result.reportPath, JSON.stringify(result, null, 2));
+  if (result.textReportPath) fs.writeFileSync(result.textReportPath, '\uFEFF' + formatTextReport(result), 'utf8');
   log(formatResult(result));
+  if (catalogError) {
+    const message = '대화 목록 정리에 실패했습니다. '
+      + `Codex를 종료한 뒤 repair-list.cmd로 다시 시도해 주세요.\n${catalogError.message}`;
+    if (!cleanupError) throw Object.assign(new Error(message, { cause: catalogError }), { report: result });
+    log(message);
+  }
+  if (cleanupError) throw cleanupError;
   return result;
 }
 

@@ -6,6 +6,7 @@ import os from 'node:os';
 import zlib from 'node:zlib';
 import { randomUUID } from 'node:crypto';
 import { planCleanup, listAll, readPins, recheckGroup, Rpc, locateCodex, run } from './cleanup.mjs';
+import { manual } from './manual.mjs';
 
 const now = Date.now() / 1000;
 const cutoff = now - 7 * 86400;
@@ -187,12 +188,96 @@ test('a compressed rollout left behind by a successful delete call is reported a
   fs.writeFileSync(path.join(home, 'fake-thread.json'), JSON.stringify(t));
   const protect = path.join(home, 'protect.json'); fs.writeFileSync(protect, '[]');
   await assert.rejects(run({ home, protectFile: protect, apply: true, entry, output: 'quiet' }), e => {
-    const report = JSON.parse(fs.readFileSync(e.message.match(/inspect (.+)$/)[1], 'utf8'));
+    const report = e.report;
+    assert.deepEqual(report, JSON.parse(fs.readFileSync(report.reportPath, 'utf8')));
     assert.deepEqual(report.deleted, []);
     assert.deepEqual(report.failed, [{ rootId: t.id, error: 'Deletion API returned but rollout files remain' }]);
     return true;
   });
 });
+
+// Exercise the complete run -> manual -> catalog path with an isolated state DB.
+const partialFailureServer = `
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { createInterface } from 'node:readline';
+const home = process.env.CODEX_HOME;
+const { threads, scenario } = JSON.parse(fs.readFileSync(path.join(home, 'fake-threads.json'), 'utf8'));
+const deleted = new Set();
+createInterface({ input: process.stdin }).on('line', line => {
+  const { id, method, params = {} } = JSON.parse(line);
+  if (id === undefined) return;
+  let result = {}, error;
+  if (method === 'thread/list') {
+    if (!params.ancestorThreadId && deleted.size && scenario === 'final-list') {
+      error = { code: -32000, message: 'synthetic final list failure' };
+    } else result = { data: params.archived || params.ancestorThreadId ? [] : threads.filter(t => !deleted.has(t.id)), nextCursor: null };
+  } else if (method === 'thread/read') result = { thread: threads.find(t => t.id === params.threadId) };
+  else if (method === 'thread/delete') {
+    if (scenario === 'delete' && params.threadId === threads[1].id) error = { code: -32000, message: 'synthetic deletion failure' };
+    else {
+      const t = threads.find(t => t.id === params.threadId);
+      fs.unlinkSync(t.path);
+      const db = new DatabaseSync(path.join(home, 'state_5.sqlite'));
+      db.prepare('DELETE FROM threads WHERE id = ?').run(t.id); db.close();
+      deleted.add(t.id);
+    }
+  }
+  process.stdout.write(JSON.stringify(error ? { id, error } : { id, result }) + '\\n');
+});
+`;
+
+for (const scenario of ['delete', 'final-list']) {
+  test(`manual repairs verified successes and still fails after ${scenario} failure`, async () => {
+    const { DatabaseSync } = await import('node:sqlite');
+    const home = fixture(), threads = [thread(home), thread(home)];
+    const entry = path.join(home, 'partial-app-server.mjs');
+    fs.writeFileSync(entry, partialFailureServer);
+    fs.writeFileSync(path.join(home, 'fake-threads.json'), JSON.stringify({ threads, scenario }));
+    fs.writeFileSync(path.join(home, '.codex-global-state.json'), JSON.stringify({ 'pinned-thread-ids': [] }));
+    const state = new DatabaseSync(path.join(home, 'state_5.sqlite'));
+    state.exec('CREATE TABLE threads (id TEXT PRIMARY KEY)');
+    for (const t of threads) state.prepare('INSERT INTO threads VALUES (?)').run(t.id);
+    state.close();
+    fs.mkdirSync(path.join(home, 'sqlite'));
+    const catalog = new DatabaseSync(path.join(home, 'sqlite', 'codex.db'));
+    catalog.exec(`
+      CREATE TABLE local_thread_catalog (host_id TEXT, thread_id TEXT, PRIMARY KEY(host_id, thread_id));
+      CREATE TABLE local_thread_catalog_metadata (id INTEGER PRIMARY KEY, catalog_revision INTEGER);
+      INSERT INTO local_thread_catalog_metadata VALUES (1, 0);
+      CREATE TABLE local_thread_catalog_sync_state (host_id TEXT PRIMARY KEY, observation_sequence INTEGER);
+      INSERT INTO local_thread_catalog_sync_state VALUES ('local', 0);
+      CREATE TABLE local_thread_catalog_scan_checkpoints (host_id TEXT PRIMARY KEY);
+      CREATE TABLE local_thread_catalog_scan_entries (host_id TEXT, thread_id TEXT, removed INTEGER, PRIMARY KEY(host_id, thread_id));
+    `);
+    for (const t of threads) catalog.prepare("INSERT INTO local_thread_catalog VALUES ('local', ?)").run(t.id);
+    catalog.close();
+    const expectedDeleted = scenario === 'delete' ? 1 : 2;
+    await assert.rejects(manual({ protectionFile: path.join(home, 'protected.json'), backupDir: path.join(home, 'backups'),
+      checkClosed: async () => {}, ask: async () => 'DELETE 2', log: () => {},
+      runCleanup: options => run({ home, entry, ...options, output: 'quiet' }),
+    }), error => {
+      const report = error.report;
+      assert.match(error.message, scenario === 'delete' ? /Some deletions failed/ : /synthetic final list failure/);
+      assert.equal(report.deleted.length, expectedDeleted);
+      assert.equal(report.failed.length, scenario === 'delete' ? 1 : 0);
+      assert.equal(report.catalogCleanup.removedRows, expectedDeleted);
+      const saved = JSON.parse(fs.readFileSync(report.reportPath, 'utf8'));
+      assert.equal(saved.error, error.message);
+      assert.equal(saved.catalogCleanup.removedRows, expectedDeleted);
+      assert(fs.readFileSync(report.textReportPath, 'utf8').includes(error.message));
+      return true;
+    });
+    const remaining = new DatabaseSync(path.join(home, 'sqlite', 'codex.db'), { readOnly: true });
+    try {
+      assert.deepEqual(remaining.prepare('SELECT thread_id FROM local_thread_catalog').all().map(r => r.thread_id),
+        scenario === 'delete' ? [threads[1].id] : []);
+    } finally { remaining.close(); }
+    assert.equal(fs.existsSync(threads[0].path), false);
+    assert.equal(fs.existsSync(threads[1].path), scenario === 'delete');
+  });
+}
 
 test('official deletion API removes only eligible synthetic logs and their metadata', { timeout: 180000 }, async () => {
   const home = fixture();

@@ -69,6 +69,11 @@ export function formatResult(report) {
     `조건 변경·건너뜀: ${number(report.skipped?.length)}개 묶음`,
     `실패           : ${number(report.failed?.length)}개 묶음`,
     `상세 결과      : ${report.textReportPath || report.reportPath}`];
+  if (report.catalogCleanup) {
+    lines.push(`정리한 목록 항목: ${number(report.catalogCleanup.removedRows)}개`);
+    if (report.catalogCleanup.backupDirectory) lines.push(`목록 DB 백업    : ${report.catalogCleanup.backupDirectory}`);
+  }
+  if (report.catalogCleanupError) lines.push(`대화 목록 정리 실패: ${report.catalogCleanupError}`);
   return lines.join('\n');
 }
 

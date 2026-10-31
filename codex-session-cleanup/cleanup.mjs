@@ -98,7 +98,8 @@ function inside(root, file) {
 // .jsonl path in its database, so both spellings belong to the same session.
 export const rolloutFiles = file => [file, file + '.zst'];
 
-export function fileInfo(thread, home) {
+// Validate persisted report content without consulting the current filesystem.
+export function resolveRolloutPath(thread, home) {
   if (!thread.path || !uuid.test(thread.id)) throw new Error(`Missing or invalid session path: ${thread.id}`);
   const file = path.resolve(thread.path);
   const roots = ['sessions', 'archived_sessions'].map(p => path.join(home, p));
@@ -106,6 +107,11 @@ export function fileInfo(thread, home) {
   if (!root || path.extname(file) !== '.jsonl' || !path.basename(file).includes(thread.id)) {
     throw new Error(`Unexpected rollout path: ${file}`);
   }
+  return { file, root };
+}
+
+export function fileInfo(thread, home) {
+  const { file, root } = resolveRolloutPath(thread, home);
   let bytes = 0, modified = 0, exists = false;
   for (const stored of rolloutFiles(file)) {
     let stat;
@@ -352,7 +358,12 @@ export async function run(options = {}) {
     else if (options.apply && options.output !== 'quiet') console.log(formatResult(report));
     if (report.failed.length) throw new Error(`Some deletions failed; inspect ${reportPath}`);
     return report;
-  } catch (e) { report.error = e.message; save(); saveText(); throw e; }
+  } catch (e) {
+    report.error = e.message;
+    // Callers need the successful groups even when deletion or final verification fails.
+    e.report = report;
+    save(); saveText(); throw e;
+  }
   finally { rpc.close(); }
 }
 
