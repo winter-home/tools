@@ -12,7 +12,7 @@ import { applyPreview, collectFiles, loadConfig, preview, verifyDeletedSessions 
 import { manual } from './manual.mjs';
 import { desktopDirectories, readProtection } from './protection.mjs';
 import { isClaudeProcess } from './processes.mjs';
-import { checked } from './files.mjs';
+import { atomicJson, backupFiles, checked, fileInventory } from './files.mjs';
 
 const day = 86400000, old = Date.now() - 10 * day;
 const config = { days: 7, protectedIds: [], desktopDataDirs: [] };
@@ -219,6 +219,75 @@ test('백업 쓰기 실패 시 원본을 삭제하지 않고 잠금을 해제', 
   f.write(path.join(f.reportsDir, 'backups'), 'not a directory');
   await assert.rejects(f.apply(scan), /정리를 중단/);
   assert.ok(fs.existsSync(session.file)); assert.ok(!fs.existsSync(path.join(f.home, '.session-cleanup.lock')));
+});
+
+test('백업은 압축 동기화와 닫힘, manifest 동기화와 확정 순서로 완료', async t => {
+  const f = fixture(t), session = f.session(), original = fs.readFileSync(session.file);
+  const events = [], create = fs.createWriteStream, sync = fs.fsync, syncSync = fs.fsyncSync, rename = fs.renameSync;
+  t.mock.method(fs, 'createWriteStream', (...args) => {
+    const stream = create(...args);
+    stream.on('close', () => events.push('gzip-close'));
+    return stream;
+  });
+  t.mock.method(fs, 'fsync', (fd, callback) => sync(fd, error => {
+    if (!error) events.push('gzip-sync');
+    // Delay completion so an early backup return or manifest write is observable.
+    setImmediate(() => callback(error));
+  }));
+  t.mock.method(fs, 'fsyncSync', fd => { syncSync(fd); events.push('manifest-sync'); });
+  t.mock.method(fs, 'renameSync', (...args) => { rename(...args); events.push('manifest-rename'); });
+  const manifest = await backupFiles(fileInventory(f.home, session.file), path.join(f.reportsDir, 'backup'));
+  events.push('backup-complete');
+  assert.deepEqual(events, ['gzip-sync', 'gzip-close', 'manifest-sync', 'manifest-rename', 'backup-complete']);
+  assert.deepEqual(gunzipSync(fs.readFileSync(manifest[0].backup)), original);
+  assert.deepEqual(fs.readFileSync(session.file), original);
+  // Reports and other ordinary JSON writes keep their existing policy.
+  atomicJson(path.join(f.reportsDir, 'ordinary.json'), {});
+  assert.equal(events.filter(event => event === 'manifest-sync').length, 1);
+});
+
+test('압축 백업 동기화 실패 시 원본 삭제를 시작하지 않음', async t => {
+  const f = fixture(t), session = f.session(), original = fs.readFileSync(session.file), scan = await f.scan();
+  const failure = new Error('gzip fsync failure fixture');
+  const sync = t.mock.method(fs, 'fsync', (fd, callback) => setImmediate(() => callback(failure)));
+  await assert.rejects(f.apply(scan), error => {
+    assert.equal(error.cause, failure); assert.equal(error.report.failed[0].removed.length, 0);
+    assert.ok(!fs.existsSync(path.join(error.report.failed[0].backupDir, 'manifest.json')));
+    return true;
+  });
+  assert.equal(sync.mock.callCount(), 1);
+  assert.deepEqual(fs.readFileSync(session.file), original);
+  assert.ok(!fs.existsSync(path.join(f.home, '.session-cleanup.lock')));
+});
+
+test('공유 또는 세션 manifest 동기화 실패 시 원본과 인덱스를 보존', async t => {
+  for (const scope of ['shared', 'session']) await t.test(scope, async t => {
+    const f = fixture(t), session = f.session();
+    const index = f.write(path.join(path.dirname(session.file), 'sessions-index.json'), { entries: [{ sessionId: session.id }] });
+    const before = [session.file, index].map(file => fs.readFileSync(file)), scan = await f.scan();
+    const descriptors = new Map(), open = fs.openSync, sync = fs.fsyncSync;
+    const failure = new Error(`${scope} manifest fsync failure fixture`);
+    let failedFile;
+    t.mock.method(fs, 'openSync', (...args) => {
+      const fd = open(...args); descriptors.set(fd, args[0]); return fd;
+    });
+    t.mock.method(fs, 'fsyncSync', fd => {
+      const file = descriptors.get(fd);
+      if (typeof file === 'string' && path.basename(file) === `manifest.json.${process.pid}.tmp`
+        && path.basename(path.dirname(file)) === (scope === 'shared' ? 'shared' : session.id)) {
+        failedFile = file; throw failure;
+      }
+      return sync(fd);
+    });
+    await assert.rejects(f.apply(scan), error => {
+      assert.equal(error.cause, failure); assert.equal(error.report.deleted.length, 0);
+      assert.ok(error.report.failed.every(item => !item.removed.length)); return true;
+    });
+    assert.ok(failedFile);
+    assert.ok(!fs.existsSync(path.join(path.dirname(failedFile), 'manifest.json')));
+    [session.file, index].forEach((file, i) => assert.deepEqual(fs.readFileSync(file), before[i]));
+    assert.ok(!fs.existsSync(path.join(f.home, '.session-cleanup.lock')));
+  });
 });
 
 test('같은 인덱스의 여러 승인 세션을 순차 정리해도 새 항목을 유지', async t => {

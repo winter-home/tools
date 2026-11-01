@@ -56,9 +56,9 @@ export function sameFiles(a, b) {
   return JSON.stringify(ordered(a)) === JSON.stringify(ordered(b));
 }
 
-export function atomicJson(file, value) {
+export function atomicJson(file, value, { flush = false } = {}) {
   const temp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { flag: 'wx', flush });
   try { fs.renameSync(temp, file); }
   finally { if (exists(temp)) fs.unlinkSync(temp); }
 }
@@ -70,10 +70,10 @@ export async function backupFiles(files, directory) {
     checked(item.root, item.file);
     const backup = path.join(directory, `${index}.gz`);
     await pipeline(fs.createReadStream(item.file), createGzip({ level: 1 }),
-      fs.createWriteStream(backup, { flags: 'wx' }));
+      fs.createWriteStream(backup, { flags: 'wx', flush: true }));
     manifest.push({ original: item.file, backup, size: item.size });
   }
-  // A complete manifest is required before the caller is allowed to delete anything.
-  atomicJson(path.join(directory, 'manifest.json'), { files: manifest });
+  // Payloads must be flushed and closed, then the manifest flushed and renamed, before deletion.
+  atomicJson(path.join(directory, 'manifest.json'), { files: manifest }, { flush: true });
   return manifest;
 }
