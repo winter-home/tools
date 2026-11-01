@@ -66,7 +66,7 @@ export function formatResult(report) {
   const lines = ['', '삭제 결과', '────────────────────────────────────────',
     `삭제한 세션     : ${number(deleted.reduce((n,g) => n + g.ids.length, 0))}개`,
     `삭제한 로그 용량: ${formatBytes(deleted.reduce((n,g) => n + g.bytes, 0))}`,
-    `조건 변경·건너뜀: ${number(report.skipped?.length)}개 묶음`,
+    `건너뜀·미처리   : ${number(report.skipped?.length)}개 묶음`,
     `실패           : ${number(report.failed?.length)}개 묶음`,
     `상세 결과      : ${report.textReportPath || report.reportPath}`];
   if (report.catalogCleanup) {

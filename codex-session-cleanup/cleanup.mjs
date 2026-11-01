@@ -13,7 +13,7 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class Rpc {
   constructor(entry, home) {
-    this.pending = new Map(); this.sequence = 0; this.diagnostics = '';
+    this.pending = new Map(); this.sequence = 0; this.diagnostics = ''; this.terminalError = null;
     const script = /\.[cm]?js$/i.test(entry);
     this.proc = spawn(script ? process.execPath : entry, [...(script ? [entry] : []), 'app-server', '--listen', 'stdio://'], {
       env: { ...process.env, CODEX_HOME: home }, windowsHide: true,
@@ -38,15 +38,28 @@ export class Rpc {
     this.proc.stderr.on('data', chunk => {
       this.diagnostics = (this.diagnostics + chunk.toString()).slice(-6000);
     });
-    const fail = error => {
-      for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); }
-      this.pending.clear();
-    };
-    this.proc.on('error', fail);
-    this.proc.on('exit', code => fail(new Error(`Codex server exited (${code}): ${this.diagnostics}`)));
+    // Own both directions of the transport, including readline's forwarded input errors.
+    for (const source of [this.proc, this.proc.stdin, this.proc.stdout, this.lines]) {
+      source.on('error', error => this.fail(error));
+    }
+    const outputClosed = () => this.fail(new Error(`Codex server output closed: ${this.diagnostics}`));
+    this.lines.on('close', outputClosed); // EOF, including an unterminated final response.
+    this.proc.stdout.on('close', outputClosed); // A destroyed socket may close without EOF.
+    this.proc.on('exit', (code, signal) => this.fail(new Error(`Codex server exited (${signal || code}): ${this.diagnostics}`)));
   }
-  send(message) { this.proc.stdin.write(JSON.stringify(message) + '\n'); }
+  fail(error) {
+    this.terminalError ||= error;
+    for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(this.terminalError); }
+    this.pending.clear();
+  }
+  send(message) {
+    if (this.terminalError) return;
+    try {
+      this.proc.stdin.write(JSON.stringify(message) + '\n', error => { if (error) this.fail(error); });
+    } catch (error) { this.fail(error); }
+  }
   request(method, params = {}) {
+    if (this.terminalError) return Promise.reject(this.terminalError);
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -63,7 +76,10 @@ export class Rpc {
     });
     this.send({ method: 'initialized', params: {} });
   }
-  close() { this.proc.stdin.end(); this.lines.close(); this.proc.kill(); }
+  close() {
+    this.fail(new Error('Codex server connection closed'));
+    this.proc.stdin.end(); this.lines.close(); this.proc.kill();
+  }
 }
 
 export function locateCodex() {
@@ -199,7 +215,8 @@ export function planCleanup(threads, pins, protectedIds, cutoff, home) {
   const reasons = new Map(); const info = new Map();
   for (const t of threads) {
     const why = [];
-    if (pins.has(t.id) || t.isPinned === true) why.push('pinned');
+    // readPins owns the desktop-list/latest-DB policy; thread metadata cannot override it.
+    if (pins.has(t.id)) why.push('pinned');
     if (protectedIds.has(t.id)) why.push('explicitly-protected');
     if (t.ephemeral) why.push('ephemeral');
     if (t.status?.type !== 'notLoaded') why.push('loaded-or-running');
@@ -254,13 +271,13 @@ export async function recheckGroup(rpc, group, home, protectedIds, cutoff) {
     if (!name) return { allowed: false, reason: 'missing-state-db' };
     const db = new DatabaseSync(path.join(home, name), { readOnly: true });
     let row;
-    try { row = db.prepare('SELECT id,rollout_path,updated_at,recency_at,source,title,is_pinned FROM threads WHERE id = ?').get(group.rootId); }
+    try { row = db.prepare('SELECT id,rollout_path,updated_at,recency_at,source,title FROM threads WHERE id = ?').get(group.rootId); }
     finally { db.close(); }
     if (!row) return { allowed: false, reason: 'already-removed' };
     let source = row.source;
     if (typeof source === 'string' && source.startsWith('{')) source = JSON.parse(source);
     root = { id: row.id, path: row.rollout_path, updatedAt: row.updated_at,
-      recencyAt: row.recency_at, source, name: row.title, isPinned: Boolean(row.is_pinned),
+      recencyAt: row.recency_at, source, name: row.title,
       ephemeral: false, status: { type: 'notLoaded' } };
   }
   fresh.push(root);
@@ -333,7 +350,7 @@ export async function run(options = {}) {
       protectionReasons: report.protectionReasons, reportPath }));
     else if (options.output !== 'quiet') console.log(formatPreview(report));
     if (options.apply) {
-      for (const group of plan.groups) {
+      for (const [index, group] of plan.groups.entries()) {
         try {
           const check = await recheckGroup(rpc, group, home, protectedIds, cutoff);
           if (!check.allowed) { report.skipped.push({ rootId: group.rootId, reason: check.reason }); save(); continue; }
@@ -342,8 +359,18 @@ export async function run(options = {}) {
           if (remaining.length) throw new Error('Deletion API returned but rollout files remain');
           report.deleted.push({ rootId: group.rootId, ids: group.ids, bytes: check.group.bytes });
           save();
-        } catch (e) { report.failed.push({ rootId: group.rootId, error: e.message }); save(); }
+        } catch (e) {
+          report.failed.push({ rootId: group.rootId, error: e.message });
+          if (rpc.terminalError) {
+            for (const pending of plan.groups.slice(index + 1)) {
+              report.skipped.push({ rootId: pending.rootId, reason: 'Codex 서버 연결 종료로 미처리' });
+            }
+            throw rpc.terminalError;
+          }
+          save();
+        }
       }
+      if (rpc.terminalError) throw rpc.terminalError;
       const finalThreads = await listAll(rpc, config.includeArchived, { useStateDbOnly: true });
       const remainingIds = new Set(finalThreads.map(t => t.id));
       for (const deleted of report.deleted) {

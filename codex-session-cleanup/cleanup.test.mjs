@@ -42,11 +42,11 @@ function thread(home, { id = randomUUID(), updatedAt = old, parent = null, archi
 
 test('seven-day cutoff, runtime status, explicit pins, and modified rollouts are protected', () => {
   const home = fixture();
-  const eligible = thread(home);
-  const entries = [eligible, thread(home, { updatedAt: recent }), thread(home, { pinned: true }),
+  const eligible = thread(home), pinned = thread(home, { pinned: true });
+  const entries = [eligible, thread(home, { updatedAt: recent }), pinned,
     thread(home, { status: 'active' }), thread(home, { modified: recent }), thread(home, { updatedAt: cutoff })];
   const explicit = thread(home); entries.push(explicit);
-  const p = planCleanup(entries, new Set(), new Set([explicit.id]), cutoff, home);
+  const p = planCleanup(entries, new Set([pinned.id]), new Set([explicit.id]), cutoff, home);
   assert.deepEqual(p.groups.map(g => g.rootId), [eligible.id], JSON.stringify([...p.reasons]));
 });
 
@@ -161,6 +161,29 @@ test('without desktop state only the latest database supplies current pins', asy
   assert.deepEqual([...await readPins(home)], [current]);
 });
 
+test('planning and missing-rollout rechecks share the selected pin authority', async t => {
+  const { DatabaseSync } = await import('node:sqlite');
+  for (const mode of ['desktop-empty', 'desktop-pinned', 'db-only']) await t.test(mode, async () => {
+    const home = fixture(), root = thread(home, { pinned: true });
+    fs.unlinkSync(root.path); // Only this disposable synthetic rollout is removed.
+    const db = new DatabaseSync(path.join(home, 'state_5.sqlite'));
+    db.exec(`CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, updated_at REAL,
+      recency_at REAL, source TEXT, title TEXT, is_pinned INTEGER)`);
+    db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,1)').run(root.id, root.path, old, old, 'cli', 'fixture');
+    db.close();
+    if (mode !== 'db-only') fs.writeFileSync(path.join(home, '.codex-global-state.json'),
+      JSON.stringify({ 'pinned-thread-ids': mode === 'desktop-pinned' ? [root.id] : [] }));
+    const approved = planCleanup([root], new Set(), new Set(), cutoff, home).groups[0];
+    assert.ok(approved); // A stale thread.isPinned cannot bypass the selected pin set.
+    const plan = planCleanup([root], await readPins(home), new Set(), cutoff, home);
+    const rpc = { request: async () => ({ data: [], nextCursor: null }) };
+    const check = await recheckGroup(rpc, approved, home, new Set(), cutoff);
+    const allowed = mode === 'desktop-empty';
+    assert.equal(plan.groups.length === 1, allowed);
+    assert.equal(check.allowed, allowed);
+  });
+});
+
 test('retention below seven days is rejected', async () => {
   await assert.rejects(run({ days: 6 }), /Retention must be at least 7 days/);
 });
@@ -180,6 +203,86 @@ createInterface({ input: process.stdin }).on('line', line => {
   process.stdout.write(JSON.stringify({ id, result }) + '\\n');
 });
 `;
+
+const rpcServer = leakyServer.replace('const result =', `
+  if (method === 'pending') return;
+  const result =`);
+
+test('RPC exit rejects pending and future requests with the first error without new timers', { timeout: 10000 }, async t => {
+  const home = fixture(), entry = path.join(home, 'rpc-app-server.mjs');
+  fs.writeFileSync(path.join(home, 'fake-thread.json'), JSON.stringify(thread(home)));
+  fs.writeFileSync(entry, rpcServer);
+  const rpc = new Rpc(entry, home); t.after(() => rpc.close());
+  await rpc.initialize();
+  const pending = Promise.allSettled([rpc.request('pending'), rpc.request('pending')]);
+  await rpc.request('ready'); // Ensure both pending requests reached the server before killing it.
+  rpc.proc.kill();
+  const results = await pending, failure = rpc.terminalError;
+  assert.match(failure.message, /Codex server (exited|output closed)/);
+  assert.ok(results.every(result => result.status === 'rejected' && result.reason === failure));
+  assert.equal(rpc.pending.size, 0);
+  const timer = t.mock.method(globalThis, 'setTimeout', () => { throw new Error('must not start another RPC timer'); });
+  const write = t.mock.method(rpc.proc.stdin, 'write', () => { throw new Error('must not write after exit'); });
+  await assert.rejects(rpc.request('after-exit'), error => error === failure);
+  assert.equal(timer.mock.callCount(), 0); assert.equal(write.mock.callCount(), 0);
+  rpc.close(); assert.equal(rpc.terminalError, failure);
+});
+
+test('RPC send errors use the same terminal state and keep the original cause', { timeout: 10000 }, async t => {
+  const home = fixture(), entry = path.join(home, 'rpc-app-server.mjs');
+  fs.writeFileSync(path.join(home, 'fake-thread.json'), JSON.stringify(thread(home)));
+  fs.writeFileSync(entry, leakyServer);
+  const rpc = new Rpc(entry, home); t.after(() => rpc.close());
+  await rpc.initialize();
+  const failure = new Error('synthetic stdin failure');
+  t.mock.method(rpc.proc.stdin, 'write', (data, callback) => { queueMicrotask(() => callback(failure)); return false; });
+  await assert.rejects(rpc.request('send-failure'), error => error === failure);
+  rpc.proc.stdin.emit('error', new Error('later stream error'));
+  rpc.proc.emit('error', new Error('later process error'));
+  await assert.rejects(rpc.request('after-failure'), error => error === failure);
+  assert.equal(rpc.pending.size, 0); assert.equal(rpc.terminalError, failure);
+});
+
+test('RPC output EOF rejects requests even while the server and stdin remain alive', { timeout: 10000 }, async t => {
+  const home = fixture(), entry = path.join(home, 'rpc-app-server.mjs');
+  fs.writeFileSync(path.join(home, 'fake-thread.json'), JSON.stringify(thread(home)));
+  fs.writeFileSync(entry, rpcServer);
+  const rpc = new Rpc(entry, home); t.after(() => rpc.close());
+  await rpc.initialize();
+  const pending = Promise.allSettled([rpc.request('pending'), rpc.request('pending')]);
+  await rpc.request('ready');
+  // Inject EOF at the response transport boundary without Node's special stdio shutdown behavior.
+  rpc.proc.stdout.push(null);
+  const results = await pending;
+  const failure = rpc.terminalError;
+  assert.match(failure.message, /Codex server output closed/);
+  assert.ok(results.every(result => result.status === 'rejected' && result.reason === failure));
+  assert.equal(rpc.proc.exitCode, null); assert.equal(rpc.proc.stdin.destroyed, false);
+  assert.equal(rpc.pending.size, 0);
+  await assert.rejects(rpc.request('after-eof'), error => error === failure);
+});
+
+for (const mode of ['error', 'close-only']) {
+  test(`RPC output ${mode} uses the terminal state without an uncaught readline error`, { timeout: 10000 }, async t => {
+    const home = fixture(), entry = path.join(home, 'rpc-app-server.mjs');
+    fs.writeFileSync(path.join(home, 'fake-thread.json'), JSON.stringify(thread(home)));
+    fs.writeFileSync(entry, rpcServer);
+    const rpc = new Rpc(entry, home); t.after(() => rpc.close());
+    await rpc.initialize();
+    const pending = rpc.request('pending');
+    const rejected = assert.rejects(pending, error => error === rpc.terminalError);
+    await rpc.request('ready');
+    const failure = mode === 'error' ? new Error('synthetic output read failure') : undefined;
+    rpc.proc.stdout.destroy(failure);
+    await rejected;
+    assert.equal(rpc.proc.exitCode, null); assert.equal(rpc.pending.size, 0);
+    if (failure) assert.equal(rpc.terminalError, failure);
+    else assert.match(rpc.terminalError.message, /Codex server output closed/);
+    const original = rpc.terminalError;
+    rpc.proc.stdout.emit('error', new Error('later output error'));
+    await assert.rejects(rpc.request('after-output-failure'), error => error === original);
+  });
+}
 
 test('a compressed rollout left behind by a successful delete call is reported as a failure', async () => {
   const home = fixture(), t = thread(home);
@@ -208,8 +311,10 @@ const deleted = new Set();
 createInterface({ input: process.stdin }).on('line', line => {
   const { id, method, params = {} } = JSON.parse(line);
   if (id === undefined) return;
+  fs.appendFileSync(path.join(home, 'fake-requests.jsonl'), JSON.stringify({ method, params }) + '\\n');
   let result = {}, error;
   if (method === 'thread/list') {
+    if (scenario === 'server-exit' && params.ancestorThreadId === threads[1].id) process.exit(23);
     if (!params.ancestorThreadId && deleted.size && scenario === 'final-list') {
       error = { code: -32000, message: 'synthetic final list failure' };
     } else result = { data: params.archived || params.ancestorThreadId ? [] : threads.filter(t => !deleted.has(t.id)), nextCursor: null };
@@ -222,16 +327,18 @@ createInterface({ input: process.stdin }).on('line', line => {
       const db = new DatabaseSync(path.join(home, 'state_5.sqlite'));
       db.prepare('DELETE FROM threads WHERE id = ?').run(t.id); db.close();
       deleted.add(t.id);
+      if (scenario === 'delete-then-exit' && params.threadId === threads[1].id) process.exit(24);
     }
   }
   process.stdout.write(JSON.stringify(error ? { id, error } : { id, result }) + '\\n');
 });
 `;
 
-for (const scenario of ['delete', 'final-list']) {
-  test(`manual repairs verified successes and still fails after ${scenario} failure`, async () => {
+for (const scenario of ['delete', 'final-list', 'server-exit', 'delete-then-exit']) {
+  test(`manual repairs verified successes and still fails after ${scenario} failure`, { timeout: 10000 }, async () => {
     const { DatabaseSync } = await import('node:sqlite');
-    const home = fixture(), threads = [thread(home), thread(home)];
+    const connectionLost = scenario.endsWith('exit');
+    const home = fixture(), threads = Array.from({ length: connectionLost ? 3 : 2 }, () => thread(home));
     const entry = path.join(home, 'partial-app-server.mjs');
     fs.writeFileSync(entry, partialFailureServer);
     fs.writeFileSync(path.join(home, 'fake-threads.json'), JSON.stringify({ threads, scenario }));
@@ -253,15 +360,16 @@ for (const scenario of ['delete', 'final-list']) {
     `);
     for (const t of threads) catalog.prepare("INSERT INTO local_thread_catalog VALUES ('local', ?)").run(t.id);
     catalog.close();
-    const expectedDeleted = scenario === 'delete' ? 1 : 2;
+    const expectedDeleted = scenario === 'final-list' ? 2 : 1;
     await assert.rejects(manual({ protectionFile: path.join(home, 'protected.json'), backupDir: path.join(home, 'backups'),
-      checkClosed: async () => {}, ask: async () => 'DELETE 2', log: () => {},
+      checkClosed: async () => {}, ask: async () => `DELETE ${threads.length}`, log: () => {},
       runCleanup: options => run({ home, entry, ...options, output: 'quiet' }),
     }), error => {
       const report = error.report;
-      assert.match(error.message, scenario === 'delete' ? /Some deletions failed/ : /synthetic final list failure/);
+      assert.match(error.message, connectionLost ? /Codex server (exited|output closed)/ : scenario === 'delete' ? /Some deletions failed/ : /synthetic final list failure/);
       assert.equal(report.deleted.length, expectedDeleted);
-      assert.equal(report.failed.length, scenario === 'delete' ? 1 : 0);
+      assert.equal(report.failed.length, scenario === 'final-list' ? 0 : 1);
+      if (connectionLost) assert.deepEqual(report.skipped, [{ rootId: threads[2].id, reason: 'Codex 서버 연결 종료로 미처리' }]);
       assert.equal(report.catalogCleanup.removedRows, expectedDeleted);
       const saved = JSON.parse(fs.readFileSync(report.reportPath, 'utf8'));
       assert.equal(saved.error, error.message);
@@ -271,11 +379,20 @@ for (const scenario of ['delete', 'final-list']) {
     });
     const remaining = new DatabaseSync(path.join(home, 'sqlite', 'codex.db'), { readOnly: true });
     try {
-      assert.deepEqual(remaining.prepare('SELECT thread_id FROM local_thread_catalog').all().map(r => r.thread_id),
-        scenario === 'delete' ? [threads[1].id] : []);
+      assert.deepEqual(remaining.prepare('SELECT thread_id FROM local_thread_catalog').all().map(r => r.thread_id).sort(),
+        scenario === 'final-list' ? [] : threads.slice(1).map(t => t.id).sort());
     } finally { remaining.close(); }
     assert.equal(fs.existsSync(threads[0].path), false);
-    assert.equal(fs.existsSync(threads[1].path), scenario === 'delete');
+    assert.equal(fs.existsSync(threads[1].path), scenario === 'delete' || scenario === 'server-exit');
+    if (connectionLost) {
+      assert.ok(fs.existsSync(threads[2].path));
+      const requests = fs.readFileSync(path.join(home, 'fake-requests.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+      // Preview and apply each list active/archived once; no final RPC listing follows exit.
+      assert.equal(requests.filter(r => r.method === 'thread/list' && !r.params.ancestorThreadId).length, 4);
+      assert.ok(!requests.some(r => r.params.ancestorThreadId === threads[2].id || r.params.threadId === threads[2].id));
+      assert.deepEqual(requests.filter(r => r.method === 'thread/delete').map(r => r.params.threadId),
+        threads.slice(0, scenario === 'delete-then-exit' ? 2 : 1).map(t => t.id));
+    }
   });
 }
 
